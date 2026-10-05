@@ -1,0 +1,47 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "notification-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-05",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "notification-db",
+      // Run `wrangler d1 create notification-db` and paste the id below.
+      // Local dev (`wrangler dev`) works fine with the placeholder value.
+      "database_id": "0d434b1a-03de-45ef-a83c-89cb345a2445",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "queue": "notification-push",
+        "binding": "PUSH_QUEUE"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "notification-push",
+        // One job per invocation: each job fans out to a bounded page/chunk
+        // of devices, then chains the next page if needed.
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "max_concurrency": 3
+      }
+    ]
+  },
+  "vars": {
+    // Non-secret configuration. For local dev these are overridden by .dev.vars.
+    // Replace with your real production public key before deploying.
+    "VAPID_PUBLIC_KEY": "BG6adJvBZZuNd79kf4dm-mqesKlqTGgxTB5xnxSWBAeNuBu2CRyyVgKG24lWXU-AGfoMhi69iOjK8LFf5O3OpQg",
+    "VAPID_SUBJECT": "mailto:crendoque@tanfeethsolutions.com"
+  }
+}

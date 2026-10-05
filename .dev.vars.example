@@ -1,0 +1,5 @@
+# Local development secrets (gitignored). Do not commit.
+# Generate real values with: npm run setup:dev
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+BACKEND_AUTH_TOKEN=

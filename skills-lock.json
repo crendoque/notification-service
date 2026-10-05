@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "workers-best-practices": {
+      "source": "cloudflare/skills",
+      "sourceType": "github",
+      "skillPath": "skills/workers-best-practices/SKILL.md",
+      "computedHash": "f0b169213902a5cdd31e36141a2a1690ba4cf675c1eb5cc341b1608ff1452268"
+    },
+    "wrangler": {
+      "source": "cloudflare/skills",
+      "sourceType": "github",
+      "skillPath": "skills/wrangler/SKILL.md",
+      "computedHash": "b1cba2fab47b01915066505abdd249b60b3c7e311126224d92fed1f6ecbaa456"
+    }
+  }
+}
