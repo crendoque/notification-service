@@ -1,7 +1,7 @@
 # notification-worker
 
 Cloudflare Worker microservice that sends **Web Push notifications** for a PWA and
-**transactional email through Resend** (always asynchronous, template-aware, with
+**transactional email through Resend** (always asynchronous call, template-aware, with
 delivery status tracked from Resend webhooks).
 SMS is planned as a future phase under the same service.
 
