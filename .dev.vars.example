@@ -3,3 +3,10 @@
 VAPID_PUBLIC_KEY=
 VAPID_PRIVATE_KEY=
 BACKEND_AUTH_TOKEN=
+
+# Resend email channel.
+# RESEND_API_KEY: from https://resend.com/api-keys (use a real key for live sends).
+# RESEND_WEBHOOK_SECRET: the `whsec_...` signing secret of the webhook you create
+# at https://resend.com/webhooks pointing at POST /v1/webhooks/resend.
+RESEND_API_KEY=
+RESEND_WEBHOOK_SECRET=

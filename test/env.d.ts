@@ -10,5 +10,9 @@ declare namespace Cloudflare {
     BACKEND_AUTH_TOKEN: string;
     /** VAPID private key (Wrangler secret). */
     VAPID_PRIVATE_KEY: string;
+    /** Resend API key used to send email (Wrangler secret). */
+    RESEND_API_KEY: string;
+    /** Svix signing secret (`whsec_...`) of the Resend webhook (Wrangler secret). */
+    RESEND_WEBHOOK_SECRET: string;
   }
 }
