@@ -44,7 +44,7 @@
     "VAPID_PUBLIC_KEY": "BG6adJvBZZuNd79kf4dm-mqesKlqTGgxTB5xnxSWBAeNuBu2CRyyVgKG24lWXU-AGfoMhi69iOjK8LFf5O3OpQg",
     "VAPID_SUBJECT": "mailto:crendoque@tanfeethsolutions.com",
     // Email channel (Resend). EMAIL_FROM must use a domain verified in Resend.
-    "EMAIL_FROM": "Notification Worker <notifications@tanfeethsolutions.com>",
+    "EMAIL_FROM": "Notification Worker <notifications@notify.tanfeeth.ph>",
     // Optional: comma-separated `from` addresses callers may use. Empty = only EMAIL_FROM.
     "EMAIL_ALLOWED_SENDERS": "",
     // Optional: comma-separated app ids allowed to trigger email. Empty = any app.
