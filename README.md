@@ -31,8 +31,8 @@ Calling app                  This Worker                     Resend
      │───────────────────────────>│ { status: "delivered" }     │
 ```
 
-- **Stack**: Wrangler v4 · TypeScript · Hono · Cloudflare D1 · Cloudflare Queues · `web-push-neo` (Web Push Protocol + VAPID) · Resend (`fetch`)
-- **Storage**: `push_subscriptions` (one user → many devices), `email_requests` (one row per email trigger, incl. the payload so retries are replayable), `resend_webhook_events` (webhook dedupe + audit)
+- **Stack**: Wrangler v4 · TypeScript · Hono · Cloudflare D1 · Cloudflare Queues · Cloudflare R2 · `web-push-neo` (Web Push Protocol + VAPID) · Resend (`fetch`)
+- **Storage**: `push_subscriptions` (one user → many devices), `email_requests` (one row per email trigger, incl. the payload so retries are replayable), `resend_webhook_events` (webhook dedupe + audit), and the private R2 bucket `notification-attachments` (email attachment bytes; D1 holds only references)
 - **Auth**: every `/v1/*` route requires `Authorization: Bearer <BACKEND_AUTH_TOKEN>`, **except** `POST /v1/webhooks/resend`, which Resend authenticates with a Svix signature
 
 ---
@@ -57,6 +57,9 @@ RESEND_WEBHOOK_SECRET=whsec_...    # signing secret of the webhook you create
 Without `RESEND_API_KEY` the email endpoint answers `500 server_misconfigured`.
 See **[Testing the email channel in dev](#testing-the-email-channel-in-dev)** for
 a step-by-step walkthrough (trigger → poll status → simulated webhook events).
+
+Attachments need no local setup: `wrangler dev` provisions a local R2 bucket for the
+`ATTACHMENTS` binding on its own.
 
 Checks: `npm run typecheck` and `npm test` (runs inside workerd via `@cloudflare/vitest-plugin`).
 
@@ -242,12 +245,26 @@ curl -s -X POST "$BASE/v1/notifications/email" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"app":"crm","userId":"u1","email":"a@b.com","payload":{"useTemplate":false,"subject":"s","text":"t","cc":"x@y.com"}}'
 # 400 {"error":"unsupported_field","fields":["cc"],...}
+
+# Attachments (multipart). Local dev uses a local R2 bucket automatically, so
+# this stages the file, queues the job and deletes it again on delivery.
+printf '%s' '{"app":"crm","userId":"u1","email":"a@b.com","payload":{"useTemplate":false,"subject":"Invoice","text":"Attached","attachments":[{"field":"invoice","filename":"invoice.pdf"}]}}' > /tmp/body.json
+curl -s -X POST "$BASE/v1/notifications/email" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'payload=@/tmp/body.json;type=application/json' \
+  -F 'invoice=@/tmp/invoice.pdf;type=application/pdf'
+# 202 { ..., "attachments":[{"filename":"invoice.pdf","contentType":"application/pdf","size":...}] }
+
+# A file part with no matching `field` (and vice versa) is rejected up front:
+# 400 {"error":"attachment_part_missing","fields":["invoice"],...}
+# 400 {"error":"attachment_part_undeclared","fields":["invoice"],...}
 ```
 
 Also worth trying: `useTemplate: true` without `templateId`, `useTemplate: true`
 together with `html`, `useTemplate: false` without `subject`/body, a missing or
 badly-cased `app`, `payload.from` that is not allowlisted, and the same call
-without the `Authorization` header (`401`).
+without the `Authorization` header (`401`). For attachments: an empty file, a
+file over 15 MB (`413`), and a blocklisted extension such as `setup.exe` (`415`).
 
 ### 8. Inspect the local database
 
@@ -283,7 +300,7 @@ the simulator is enough — it takes the identical verification path.
 
 ## Production setup (once)
 
-1. `npx wrangler d1 create notification-worker` → paste the `database_id` into `wrangler.jsonc`.
+1. `npx wrangler d1 create notification-db` → paste the `database_id` into `wrangler.jsonc`.
 2. `npx wrangler queues create notification-push` → the queue the worker uses for push fan-outs **and** email delivery (bound as `PUSH_QUEUE` in `wrangler.jsonc`).
 3. Generate keys once (reuse your local pair so already-subscribed browsers keep working):
    ```bash
@@ -304,7 +321,18 @@ the simulator is enough — it takes the identical verification path.
      subscribed to: `email.sent`, `email.delivered`, `email.delivery_delayed`,
      `email.bounced`, `email.complained`, `email.failed`, `email.suppressed`.
      Copy its signing secret into `RESEND_WEBHOOK_SECRET`.
-6. `npm run db:migrate:remote && npm run deploy`.
+6. **Attachments (R2)**: create the private bucket the email trigger stages files in.
+   ```bash
+   npx wrangler r2 bucket create notification-attachments
+   ```
+   Leave it **private** — no `r2.dev` domain, no custom domain, no signed URLs. The
+   worker is the only reader, and objects are deleted as soon as the email reaches a
+   terminal delivery state, so no lifecycle rule is needed. If you also want a
+   backstop against objects orphaned by a webhook that never arrives, add one:
+   ```bash
+   npx wrangler r2 bucket lifecycle add notification-attachments expire-orphans attachments/ --expire-days 30
+   ```
+7. `npm run db:migrate:remote && npm run deploy`.
 
 > ⚠️ VAPID keys are generate-once, use-forever. Rotating the keypair breaks
 > delivery to every browser subscribed with the old public key.
@@ -536,6 +564,11 @@ Request (inline mode):
 | `payload.replyTo` | string \| string[] | — | Reply-to address(es) |
 | `payload.scheduledAt` | string | — | ISO 8601 or natural language, e.g. `in 1 min` |
 | `payload.idempotencyKey` | string | — | Passed to Resend's `Idempotency-Key` header |
+| `payload.attachments[]` | object[] | — | Files to attach (≤10). **Omit entirely** to send without attachments |
+| `payload.attachments[].field` | string | ✅ per entry | Name of the multipart part carrying the file |
+| `payload.attachments[].filename` | string | — | Overrides the part's filename (no path separators) |
+| `payload.attachments[].content_type` | string | — | Overrides the part's MIME type |
+| `payload.attachments[].content_id` | string | — | Embeds the file inline, e.g. `<img src="cid:logo">` |
 
 `payload.to`, `cc`, `bcc`, `headers` and `tags` are **rejected** with
 `400 unsupported_field` — the recipient always comes from `email`, and the
@@ -543,6 +576,97 @@ worker manages its own tags.
 
 A send with `scheduledAt` is reported as `sent` (Resend accepted it) and is
 confirmed later by the `email.sent` / `email.delivered` webhooks.
+
+#### Attachments (`multipart/form-data`)
+
+Attachments are **optional**. Send the same JSON as a `payload` part, plus one file
+part per attachment; each entry of `payload.attachments` names the part carrying its
+bytes through `field`.
+
+```http
+POST /v1/notifications/email
+Content-Type: multipart/form-data
+
+part "payload"  (application/json)
+{
+  "app": "crm",
+  "userId": "user-123",
+  "email": "user@example.com",
+  "payload": {
+    "useTemplate": false,
+    "subject": "Your invoice",
+    "html": "<p>Invoice attached.</p>",
+    "attachments": [
+      { "field": "invoice",   "filename": "invoice-1042.pdf", "content_type": "application/pdf" },
+      { "field": "statement", "content_id": "statement" }
+    ]
+  }
+}
+
+part "invoice"    (application/pdf) — 48,211 bytes
+part "statement"  (image/png)       —  8,123 bytes
+```
+
+```bash
+curl -X POST "$BASE/v1/notifications/email" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'payload=@email-body.json;type=application/json' \
+  -F 'invoice=@./invoice-1042.pdf' \
+  -F 'statement=@./statement.png'
+```
+
+A plain `application/json` body — or a multipart body with no file parts — sends an
+email with no files, exactly as before.
+
+The bytes are staged in the **private** R2 bucket `notification-attachments`; D1
+stores only a reference, so the stored payload stays tiny and every retry replays the
+identical bytes. The recipient receives a **real attached file**: no link, no URL and
+no shared-storage reference is ever created or exposed.
+
+| Rule | Value |
+|---|---|
+| Files per request | ≤ 10 |
+| Size per file | ≤ 15 MB |
+| Total per request | ≤ 15 MB |
+| Resend ceiling | 40 MB per email (measured after base64) |
+
+The 15 MB cap comes from two platform limits: the stored payload must stay far inside
+D1's 2 MB row limit, and send-time peak memory is roughly 3.7× the file size (raw
+bytes + base64 + the JSON copy) — so 15 MB is about 56 MB inside a 128 MB isolate.
+Both are the constants `EMAIL_MAX_ATTACHMENT_BYTES` and
+`EMAIL_MAX_TOTAL_ATTACHMENT_BYTES` in `src/validation.ts`.
+
+Resend refuses a fixed list of executable/script extensions; those are rejected up
+front with `415` (see
+[Resend's list](https://resend.com/docs/knowledge-base/what-attachment-types-are-not-supported)).
+Filenames containing path separators or control characters are rejected with `400`.
+
+**Lifecycle.** Staged bytes are deleted as soon as the email can no longer be retried:
+
+| Event | Staged files |
+|---|---|
+| `email.delivered` | **deleted** |
+| `email.bounced` | **deleted** — permanent, never retried |
+| `email.failed` → re-queued | **kept** — the next attempt still needs them |
+| `email.failed` → retries exhausted | **deleted** |
+| Permanent send failure in the worker | **deleted** |
+| Upload / enqueue failure | **deleted** (rolled back) |
+
+A webhook that never arrives (Svix gives up, or a `suppressed` / `complained` event,
+which this worker only observes) leaves its object behind. Add the optional lifecycle
+rule from the production setup if you want a backstop for that.
+
+Attachment-specific errors:
+
+| Status | `error` | When |
+|---|---|---|
+| `400` | `attachment_part_missing` | A `payload.attachments[].field` has no matching file part |
+| `400` | `attachment_part_undeclared` | A file part is not declared in `payload.attachments` |
+| `400` | `invalid_request` | Empty file, unusable filename, or a duplicate `field` |
+| `413` | `file_too_large` | One file exceeds 15 MB |
+| `413` | `payload_too_large` | The files together exceed 15 MB |
+| `415` | `unsupported_media_type` | Resend will not send that file extension |
+| `502` | `attachment_upload_failed` | Staging the bytes in R2 failed |
 
 Response `202`:
 
@@ -552,13 +676,19 @@ Response `202`:
   "app": "crm",
   "userId": "user-123",
   "recipient": "user@example.com",
-  "mode": "template",
-  "subject": "Your order is ready",
-  "templateId": "order-ready",
+  "mode": "inline",
+  "subject": "Your invoice",
+  "templateId": null,
   "status": "queued",
+  "attachments": [
+    { "filename": "invoice-1042.pdf", "contentType": "application/pdf", "size": 48211 }
+  ],
   "createdAt": "2026-10-27T10:00:00.000Z"
 }
 ```
+
+`attachments` is `null` when the request carries none, and it only ever holds
+metadata — the bytes stay in R2.
 
 ### 8. `GET /v1/notifications/email/:id` — delivery status
 
@@ -571,6 +701,9 @@ Response `202`:
   "mode": "template",
   "templateId": "order-ready",
   "status": "delivered",
+  "attachments": [
+    { "filename": "invoice-1042.pdf", "contentType": "application/pdf", "size": 48211 }
+  ],
   "resendId": "56761188-7520-42d8-8898-ff6fc54ce618",
   "attempts": 1,
   "createdAt": "2026-10-27T10:00:00.000Z",
@@ -715,6 +848,16 @@ curl -X POST "$BASE/v1/notifications/email" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"app":"crm","userId":"user-123","email":"user@example.com","payload":{"useTemplate":false,"subject":"Export finished","html":"<p>Your report is ready.</p>"}}'
 
+# Email — with an attachment (multipart; the JSON goes in the `payload` part)
+# body.json = {"app":"crm","userId":"user-123","email":"user@example.com",
+#              "payload":{"useTemplate":false,"subject":"Your invoice",
+#                         "html":"<p>Attached.</p>",
+#                         "attachments":[{"field":"invoice","filename":"invoice-1042.pdf"}]}}
+curl -X POST "$BASE/v1/notifications/email" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'payload=@body.json;type=application/json' \
+  -F 'invoice=@./invoice-1042.pdf;type=application/pdf'
+
 # Email — delivery status / history
 curl "$BASE/v1/notifications/email/3f1c9b7e-2a41-4f0d-9c2e-1a5b8d6f0e21" -H "Authorization: Bearer $TOKEN"
 curl "$BASE/v1/notifications/email?userId=user-123&limit=10" -H "Authorization: Bearer $TOKEN"
@@ -819,16 +962,20 @@ pruning, queue-backed fan-out.
 
 **Email (Resend)** — `POST /v1/notifications/email`, always asynchronous
 (`202 { id, status: "queued" }` + poll), template **or** inline payloads,
-`app` attribution, per-request status persisted in D1, queue retries, and delivery
+`app` attribution, optional **file attachments** staged in a private R2 bucket
+(multipart, ≤10 files / 15 MB, released once the email can no longer be retried),
+per-request status persisted in D1, queue retries, and delivery
 status refined by signed Resend webhooks (`POST /v1/webhooks/resend`).
 
 | Concern | Where it lives |
 |---|---|
-| Trigger, validation, `202` response | `src/index.ts`, `src/validation.ts` |
+| Trigger, validation, `202` response, multipart parsing | `src/index.ts`, `src/validation.ts` |
 | Resend client, payload build, error classification | `src/email.ts` |
+| R2 staging, base64 encoding, attachment cleanup keys | `src/attachments.ts` |
 | Queue job + retry/permanent-failure handling | `src/email-jobs.ts` |
-| Svix signature verification, event → status mapping | `src/resend-webhook.ts` |
+| Svix signature verification, event → status mapping, attachment release | `src/resend-webhook.ts` |
 | Request rows, status ranking, webhook dedupe | `src/db.ts`, `migrations/0002_create_email_requests.sql` |
+| Private attachment bucket | R2 `notification-attachments` (the `ATTACHMENTS` binding in `wrangler.jsonc`) |
 | Local webhook simulator | `scripts/simulate-resend-webhook.mjs` |
 
 ### Next
@@ -850,7 +997,9 @@ status refined by signed Resend webhooks (`POST /v1/webhooks/resend`).
    `failed` with `error.name: "retries_exhausted"`.
 4. **Retention / pruning** — a `scheduled` handler (cron trigger) deleting
    `email_requests` and `resend_webhook_events` older than N days; the
-   `app, seq` and `user_id, seq` indexes already support it.
+   `app, seq` and `user_id, seq` indexes already support it. The same handler is the
+   natural home for sweeping attachment objects orphaned by a webhook that never
+   arrived — today the only backstop for those is the optional R2 lifecycle rule.
 5. **Engagement + opt-out** — track `email.opened` / `email.clicked` (currently
    ignored) and add an unsubscribe/opt-out flag that the email trigger checks
    before enqueueing.

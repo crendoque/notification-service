@@ -20,6 +20,16 @@
       "migrations_dir": "migrations"
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENTS",
+      // Private staging bucket for email attachments. It is never public:
+      // no r2.dev domain, no custom domain, no signed URLs. The worker is the
+      // only reader, and objects are deleted once the email reaches a terminal
+      // delivery state.
+      "bucket_name": "notification-attachments"
+    }
+  ],
   "queues": {
     "producers": [
       {

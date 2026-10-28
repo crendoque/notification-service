@@ -3,9 +3,11 @@ import { env } from "cloudflare:test";
 import {
   buildResendPayload,
   createResendTransport,
+  resolveAttachments,
   resolveSender,
   RESEND_EMAILS_URL,
 } from "../src/email";
+import { toBase64 } from "../src/attachments";
 import type { EmailContentInput } from "../src/validation";
 
 const request = { id: "req-1", app: "crm", recipient: "user@example.com" };
@@ -72,6 +74,55 @@ describe("buildResendPayload", () => {
 
     expect(payload.reply_to).toBe("support@example.com");
     expect(payload.scheduled_at).toBe("in 1 min");
+  });
+
+  it("omits the attachments key unless resolved parts are supplied", () => {
+    const withoutAttachments = buildResendPayload(request, inlineContent, sender);
+    expect(withoutAttachments).not.toHaveProperty("attachments");
+
+    const withAttachments = buildResendPayload(request, inlineContent, sender, [
+      { filename: "invoice.pdf", content: "aGk=", content_type: "application/pdf" },
+      { filename: "logo.png", content: "aGk=", content_id: "brand" },
+    ]);
+    expect(withAttachments.attachments).toEqual([
+      { filename: "invoice.pdf", content: "aGk=", content_type: "application/pdf" },
+      { filename: "logo.png", content: "aGk=", content_id: "brand" },
+    ]);
+  });
+});
+
+describe("resolveAttachments", () => {
+  it("does not touch R2 when the request has no attachments", async () => {
+    await expect(resolveAttachments(env, [])).resolves.toEqual([]);
+  });
+
+  it("throws a permanent error when the staged object is gone", async () => {
+    await expect(
+      resolveAttachments(env, [
+        { key: "attachments/crm/does-not-exist", id: "gone", filename: "x.pdf", size: 1 },
+      ]),
+    ).rejects.toMatchObject({ errorName: "attachment_missing", retryable: false });
+  });
+});
+
+describe("toBase64", () => {
+  it("matches btoa for a payload that fits in one chunk", () => {
+    expect(toBase64(new TextEncoder().encode("invoice bytes"))).toBe(btoa("invoice bytes"));
+  });
+
+  it("round-trips a payload spanning several chunks without injecting padding", () => {
+    // Deliberately larger than one 48 KB chunk and not a multiple of 3 bytes:
+    // a misaligned chunk would make btoa emit `=` mid-string and corrupt it.
+    const bytes = new Uint8Array(49_152 * 2 + 5);
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = i % 256;
+
+    let expected = "";
+    for (let i = 0; i < bytes.length; i += 1) expected += String.fromCharCode(bytes[i]);
+
+    const encoded = toBase64(bytes);
+
+    expect(encoded).toBe(btoa(expected));
+    expect(atob(encoded)).toBe(expected);
   });
 });
 

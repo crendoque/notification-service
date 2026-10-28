@@ -57,8 +57,124 @@ export const pushBroadcastSchema = pushMessageSchema.extend({
   dryRun: z.boolean().optional().default(false),
 });
 
+/* ------------------------------------------------------------------ *
+ * Email attachments
+ * ------------------------------------------------------------------ */
+
+/**
+ * Attachment limits.
+ *
+ * Only R2 references are stored in the request payload — never the bytes — so
+ * the D1 row (2 MB hard limit) stays small. At send time the peak memory is
+ * roughly 3.7x the decoded size (bytes + base64 + the JSON copy), so 15 MB
+ * (~56 MB peak) leaves comfortable headroom inside a 128 MB isolate.
+ */
+export const EMAIL_MAX_ATTACHMENTS = 10;
+/** Largest single attachment, in decoded bytes. */
+export const EMAIL_MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+/** Largest total across all attachments of one request, in decoded bytes. */
+export const EMAIL_MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Extensions Resend refuses to send, so an upload is rejected with `415`
+ * immediately instead of failing later inside the queue.
+ * https://resend.com/docs/knowledge-base/what-attachment-types-are-not-supported
+ */
+export const UNSUPPORTED_ATTACHMENT_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".adp", ".app", ".asp", ".bas", ".bat", ".cer", ".chm", ".cmd", ".com", ".cpl",
+  ".crt", ".csh", ".der", ".exe", ".fxp", ".gadget", ".hlp", ".hta", ".inf", ".ins",
+  ".isp", ".its", ".js", ".jse", ".ksh", ".lib", ".lnk", ".mad", ".maf", ".mag",
+  ".mam", ".maq", ".mar", ".mas", ".mat", ".mau", ".mav", ".maw", ".mda", ".mdb",
+  ".mde", ".mdt", ".mdw", ".mdz", ".msc", ".msh", ".msh1", ".msh2", ".mshxml",
+  ".msh1xml", ".msh2xml", ".msi", ".msp", ".mst", ".ops", ".pcd", ".pif", ".plg",
+  ".prf", ".prg", ".reg", ".scf", ".scr", ".sct", ".shb", ".shs", ".sys", ".ps1",
+  ".ps1xml", ".ps2", ".ps2xml", ".psc1", ".psc2", ".tmp", ".url", ".vb", ".vbe",
+  ".vbs", ".vps", ".vsmacros", ".vss", ".vst", ".vsw", ".vxd", ".ws", ".wsc",
+  ".wsf", ".wsh", ".xnk",
+]);
+
+/**
+ * Filename as it appears on the attachment. Path separators and control
+ * characters are rejected so a caller cannot smuggle a path or a MIME header
+ * fragment into the message.
+ */
+export const attachmentFilenameSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine(
+    (value) =>
+      !value.includes("/") && !value.includes("\\") && !/[\u0000-\u001f\u007f]/.test(value),
+    "filename must not contain path separators or control characters",
+  )
+  .refine((value) => value !== "." && value !== "..", "filename is not a valid file name");
+
+/** MIME type, e.g. `application/pdf`. */
+export const attachmentContentTypeSchema = z
+  .string()
+  .min(3)
+  .max(255)
+  .regex(/^[\w.+-]+\/[\w.+-]+$/, "content_type must be a MIME type such as application/pdf");
+
+/** CID referenced from the HTML as `<img src="cid:<content_id>">`. */
+export const attachmentContentIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9._@-]+$/, "content_id must contain only letters, digits, . _ @ or -");
+
+/** Returns the lower-cased extension of a filename ("" when it has none). */
+export function attachmentExtension(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  return dot <= 0 ? "" : filename.slice(dot).toLowerCase();
+}
+
+/** True when Resend would refuse to send a file with this name. */
+export function isUnsupportedAttachmentFilename(filename: string): boolean {
+  return UNSUPPORTED_ATTACHMENT_EXTENSIONS.has(attachmentExtension(filename));
+}
+
+/**
+ * One entry of `payload.attachments` in the *request*.
+ *
+ * Attachments travel as `multipart/form-data` parts: `field` names the part
+ * carrying the bytes, and the worker mints the R2 reference itself. The whole
+ * field is optional — an email with no attachments needs neither.
+ */
+export const emailAttachmentInputSchema = z.object({
+  /** Name of the multipart part holding the file (`field: "invoice"` -> part `invoice`). */
+  field: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9_-]+$/, "field must be letters, digits, - or _"),
+  /** Filename shown to the recipient. Defaults to the uploaded part's filename. */
+  filename: attachmentFilenameSchema.optional(),
+  /** MIME type. Defaults to the uploaded part's Content-Type. */
+  content_type: attachmentContentTypeSchema.optional(),
+  /** Set to embed the file inline, e.g. `<img src="cid:logo">`. */
+  content_id: attachmentContentIdSchema.optional(),
+});
+export type EmailAttachmentInput = z.infer<typeof emailAttachmentInputSchema>;
+
+/**
+ * What is persisted in `email_requests.payload` for each attachment — the R2
+ * key plus the metadata needed to rebuild the Resend part on every attempt.
+ */
+export const storedAttachmentSchema = z.object({
+  /** R2 object key; the cleanup path deletes exactly this key. */
+  key: z.string().min(1).max(512),
+  id: z.string().min(1).max(64),
+  filename: attachmentFilenameSchema,
+  content_type: attachmentContentTypeSchema.optional(),
+  content_id: attachmentContentIdSchema.optional(),
+  /** Decoded size in bytes. */
+  size: z.number().int().min(0),
+});
+export type StoredAttachment = z.infer<typeof storedAttachmentSchema>;
+
 /** Email payload fields shared by the template and inline modes. */
-export const emailContentSchema = z.object({
+const emailContentBaseSchema = z.object({
   /** true -> send with a published Resend template; false -> send inline html/text. */
   useTemplate: z.boolean(),
   /** Resend template id or alias. Required when `useTemplate` is true. */
@@ -78,7 +194,26 @@ export const emailContentSchema = z.object({
   scheduledAt: z.string().min(1).max(64).optional(),
   idempotencyKey: z.string().min(1).max(256).optional(),
 });
+export type EmailContentBase = z.infer<typeof emailContentBaseSchema>;
+
+/**
+ * Request-facing payload. `attachments` describes the `multipart/form-data`
+ * parts to read; omit it (or send an empty array) to send an email with no
+ * files — attachments are always optional.
+ */
+export const emailContentSchema = emailContentBaseSchema.extend({
+  attachments: z.array(emailAttachmentInputSchema).max(EMAIL_MAX_ATTACHMENTS).optional(),
+});
 export type EmailContentInput = z.infer<typeof emailContentSchema>;
+
+/**
+ * Stored payload — the replay source for the queue consumer and every retry.
+ * `attachments` holds the resolved R2 references instead of part descriptors.
+ */
+export const storedEmailContentSchema = emailContentBaseSchema.extend({
+  attachments: z.array(storedAttachmentSchema).max(EMAIL_MAX_ATTACHMENTS).optional(),
+});
+export type StoredEmailContent = z.infer<typeof storedEmailContentSchema>;
 
 /** Statuses an email request can be in (kept in sync with db.ts). */
 export const emailStatusSchema = z.enum([
@@ -104,6 +239,18 @@ export const emailRequestSchema = z
   })
   .superRefine((value, ctx) => {
     const payload = value.payload;
+
+    // Each multipart part may be referenced once: a duplicate `field` would
+    // attach the same file twice and hide a caller mistake.
+    const fields = (payload.attachments ?? []).map((attachment) => attachment.field);
+    if (new Set(fields).size !== fields.length) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["payload", "attachments"],
+        message: "attachment `field` values must be unique",
+      });
+    }
+
     if (payload.useTemplate) {
       if (!payload.templateId) {
         ctx.addIssue({

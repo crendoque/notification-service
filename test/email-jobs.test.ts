@@ -2,11 +2,36 @@ import { beforeEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import worker from "../src/index";
 import { processEmailSend } from "../src/email-jobs";
+import { attachmentKey } from "../src/attachments";
 import { ResendError, type EmailTransport, type ResendEmailPayload } from "../src/email";
 import type { NotificationJob } from "../src/validation";
 import { applyEmailSchema, applyPushSchema, seedEmailRequests } from "./schema";
 
 const job = { kind: "email-send", requestId: "req-1" } as const;
+
+/** Removes every staged object so R2 assertions start from a clean bucket. */
+async function clearAttachments(): Promise<void> {
+  const { objects } = await env.ATTACHMENTS.list({ prefix: "attachments/" });
+  for (const object of objects) await env.ATTACHMENTS.delete(object.key);
+}
+
+/** Seeds a request whose stored payload references one staged attachment. */
+async function seedWithAttachment(id: string, key: string, size: number): Promise<void> {
+  await seedEmailRequests(env.DB, [
+    {
+      id,
+      recipient: "a@example.com",
+      payload: JSON.stringify({
+        useTemplate: false,
+        subject: "Hi",
+        text: "hello",
+        attachments: [
+          { key, id: "att-1", filename: "invoice.pdf", content_type: "application/pdf", size },
+        ],
+      }),
+    },
+  ]);
+}
 
 /** Injected transport: records payloads, then returns `result` or throws it. */
 function stubTransport(result: { id: string } | Error) {
@@ -44,6 +69,7 @@ beforeAll(async () => {
 describe("processEmailSend", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM email_requests").run();
+    await clearAttachments();
   });
 
   it("sends the stored payload and marks the request as sent", async () => {
@@ -183,6 +209,81 @@ describe("processEmailSend", () => {
 
     expect(await processEmailSend(env, job, { transport })).toBe("failed");
     expect((await readRequest("req-1"))?.error_name).toBe("invalid_stored_payload");
+  });
+
+  it("loads the staged attachment from R2 and base64-encodes it for Resend", async () => {
+    const bytes = new TextEncoder().encode("invoice bytes");
+    const key = attachmentKey("test-app", "att-1");
+    await env.ATTACHMENTS.put(key, bytes);
+    await seedWithAttachment("req-1", key, bytes.length);
+    const { calls, transport } = stubTransport({ id: "resend-1" });
+
+    expect(await processEmailSend(env, job, { transport })).toBe("sent");
+
+    expect(calls[0].attachments).toEqual([
+      {
+        filename: "invoice.pdf",
+        content: btoa("invoice bytes"),
+        content_type: "application/pdf",
+      },
+    ]);
+    // The base64 must decode back to the exact original bytes.
+    expect(atob(calls[0].attachments?.[0].content ?? "")).toBe("invoice bytes");
+    // Sending is not a cleanup point: the object survives until delivery.
+    expect(await env.ATTACHMENTS.get(key)).not.toBeNull();
+  });
+
+  it("fails permanently when a staged attachment is no longer in R2", async () => {
+    await seedWithAttachment("req-1", attachmentKey("test-app", "gone"), 5);
+    const { calls, transport } = stubTransport({ id: "resend-1" });
+
+    expect(await processEmailSend(env, job, { transport })).toBe("failed");
+
+    // The email must never go out with a silently dropped file.
+    expect(calls).toHaveLength(0);
+    const row = await readRequest("req-1");
+    expect(row?.status).toBe("failed");
+    expect(row?.error_name).toBe("attachment_missing");
+  });
+
+  it("releases the staged attachment on a permanent failure", async () => {
+    const key = attachmentKey("test-app", "att-1");
+    await env.ATTACHMENTS.put(key, "bytes");
+    await seedWithAttachment("req-1", key, 5);
+    const { transport } = stubTransport(
+      new ResendError({
+        statusCode: 403,
+        errorName: "validation_error",
+        message: "The domain is not verified",
+        retryable: false,
+      }),
+    );
+
+    expect(await processEmailSend(env, job, { transport, attempt: 1, maxAttempts: 3 })).toBe(
+      "failed",
+    );
+    expect(await env.ATTACHMENTS.get(key)).toBeNull();
+  });
+
+  it("keeps the staged attachment while a retry is still possible", async () => {
+    const key = attachmentKey("test-app", "att-1");
+    await env.ATTACHMENTS.put(key, "bytes");
+    await seedWithAttachment("req-1", key, 5);
+    const { transport } = stubTransport(
+      new ResendError({
+        statusCode: 429,
+        errorName: "rate_limit_exceeded",
+        message: "slow down",
+        retryable: true,
+      }),
+    );
+
+    await expect(
+      processEmailSend(env, job, { transport, attempt: 1, maxAttempts: 3 }),
+    ).rejects.toThrow();
+
+    // The next attempt needs the bytes, so they must survive the retry.
+    expect(await env.ATTACHMENTS.get(key)).not.toBeNull();
   });
 });
 

@@ -18,6 +18,12 @@ import { BATCH_CHUNK_SIZE, processBatchChunk, processBroadcastPage } from "./job
 import { processEmailSend } from "./email-jobs";
 import { resolveSender } from "./email";
 import {
+  deleteAttachments,
+  payloadAttachmentSummary,
+  putAttachment,
+  summarizeAttachments,
+} from "./attachments";
+import {
   handleResendWebhookEvent,
   parseSvixHeaders,
   resendWebhookEventSchema,
@@ -25,15 +31,20 @@ import {
 } from "./resend-webhook";
 import { sendPushToUser, sendPushToUsers, SYNC_DEVICE_LIMIT } from "./push";
 import {
+  attachmentFilenameSchema,
+  EMAIL_MAX_ATTACHMENT_BYTES,
+  EMAIL_MAX_TOTAL_ATTACHMENT_BYTES,
   emailListQuerySchema,
   emailRequestSchema,
   findUnsupportedEmailPayloadFields,
+  isUnsupportedAttachmentFilename,
   registerSubscriptionSchema,
   pushNotificationSchema,
   pushBatchSchema,
   pushBroadcastSchema,
   notificationJobSchema,
   type NotificationJob,
+  type StoredAttachment,
 } from "./validation";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -57,6 +68,7 @@ function serializeEmailRequest(row: EmailRequestRow) {
     mode: row.mode,
     subject: row.subject,
     templateId: row.template_id,
+    attachments: payloadAttachmentSummary(row.payload),
     status: row.status,
     resendId: row.resend_id,
     attempts: row.attempts,
@@ -208,10 +220,74 @@ v1.post("/notifications/push/all", async (c) => {
  * The request is validated, persisted (so the queued job and any retry can be
  * replayed from D1) and enqueued; Resend is never called from this handler.
  * Poll `GET /v1/notifications/email/:id` for the delivery status.
+ *
+ * Two encodings are accepted:
+ *   - `application/json` — the body as-is. `payload.attachments` is optional,
+ *     so an email without files is unchanged from before.
+ *   - `multipart/form-data` — a `payload` part holding that same JSON, plus one
+ *     file part per entry of `payload.attachments`, matched by `field`.
+ *
+ * Attachment bytes are staged in a private R2 bucket and only referenced from
+ * D1, then released once the email reaches a terminal delivery state.
  */
 v1.post("/notifications/email", async (c) => {
-  const body = await readJsonBody(c);
-  if (body === null) return c.json({ error: "invalid_json" }, 400);
+  const isMultipart = (c.req.header("content-type") ?? "")
+    .toLowerCase()
+    .includes("multipart/form-data");
+
+  let body: unknown;
+  const files = new Map<string, File>();
+
+  if (isMultipart) {
+    let form: FormData;
+    try {
+      form = await c.req.formData();
+    } catch {
+      return c.json({ error: "invalid_multipart" }, 400);
+    }
+
+    const rawPayload = form.get("payload");
+    if (typeof rawPayload !== "string") {
+      return c.json(
+        {
+          error: "invalid_request",
+          details:
+            "a `payload` form field holding the JSON body is required for multipart requests",
+        },
+        400,
+      );
+    }
+    try {
+      body = JSON.parse(rawPayload);
+    } catch {
+      return c.json({ error: "invalid_json" }, 400);
+    }
+
+    // Only file parts are read: every other field belongs inside the JSON body,
+    // and accepting them would hide a caller mistake.
+    const strayFields: string[] = [];
+    for (const [name, value] of form.entries()) {
+      if (name === "payload") continue;
+      if (typeof value === "string") {
+        strayFields.push(name);
+        continue;
+      }
+      files.set(name, value);
+    }
+    if (strayFields.length > 0) {
+      return c.json(
+        {
+          error: "unsupported_field",
+          fields: strayFields,
+          details: "All metadata belongs inside the `payload` JSON; only file parts are read.",
+        },
+        400,
+      );
+    }
+  } else {
+    body = await readJsonBody(c);
+    if (body === null) return c.json({ error: "invalid_json" }, 400);
+  }
 
   if (!c.env.RESEND_API_KEY || !c.env.EMAIL_FROM) {
     console.error(
@@ -253,22 +329,179 @@ v1.post("/notifications/email", async (c) => {
     return c.json({ error: "from_not_allowed", from: payload.from }, 400);
   }
 
+  // Attachments are optional: without them this is exactly the previous flow.
+  const declared = payload.attachments ?? [];
+  if (declared.length > 0 && !c.env.ATTACHMENTS) {
+    console.error(
+      JSON.stringify({
+        msg: "email_misconfigured",
+        hint: "the ATTACHMENTS R2 binding must be configured to send attachments",
+      }),
+    );
+    return c.json({ error: "server_misconfigured" }, 500);
+  }
+
+  // A `field` with no matching part (or a part nothing references) is a caller
+  // mistake that would otherwise silently drop or ignore a file.
+  const missingParts = declared.filter((entry) => !files.has(entry.field)).map((e) => e.field);
+  if (missingParts.length > 0) {
+    return c.json(
+      {
+        error: "attachment_part_missing",
+        fields: missingParts,
+        details: "Every `payload.attachments[].field` needs a matching file part.",
+      },
+      400,
+    );
+  }
+  const referenced = new Set(declared.map((entry) => entry.field));
+  const undeclaredParts = [...files.keys()].filter((name) => !referenced.has(name));
+  if (undeclaredParts.length > 0) {
+    return c.json(
+      {
+        error: "attachment_part_undeclared",
+        fields: undeclaredParts,
+        details: "Every file part must be declared in `payload.attachments[].field`.",
+      },
+      400,
+    );
+  }
+
+  // Validate every part before writing anything, so a rejected request leaves
+  // no bytes behind in R2.
+  const uploads: {
+    field: string;
+    filename: string;
+    contentType: string | undefined;
+    contentId: string | undefined;
+    file: File;
+  }[] = [];
+  let totalBytes = 0;
+
+  for (const entry of declared) {
+    const file = files.get(entry.field) as File;
+
+    if (file.size === 0) {
+      return c.json(
+        { error: "invalid_request", details: `attachment "${entry.field}" is empty` },
+        400,
+      );
+    }
+    if (file.size > EMAIL_MAX_ATTACHMENT_BYTES) {
+      return c.json(
+        {
+          error: "file_too_large",
+          field: entry.field,
+          size: file.size,
+          maxBytes: EMAIL_MAX_ATTACHMENT_BYTES,
+        },
+        413,
+      );
+    }
+
+    const filename = entry.filename ?? file.name;
+    if (!attachmentFilenameSchema.safeParse(filename).success) {
+      return c.json(
+        {
+          error: "invalid_request",
+          details:
+            `attachment "${entry.field}": a usable filename is required ` +
+            "(send `filename`, or a part name with no path separators)",
+        },
+        400,
+      );
+    }
+    if (isUnsupportedAttachmentFilename(filename)) {
+      return c.json({ error: "unsupported_media_type", field: entry.field, filename }, 415);
+    }
+
+    totalBytes += file.size;
+    uploads.push({
+      field: entry.field,
+      filename,
+      contentType: entry.content_type ?? (file.type || undefined),
+      contentId: entry.content_id,
+      file,
+    });
+  }
+
+  if (totalBytes > EMAIL_MAX_TOTAL_ATTACHMENT_BYTES) {
+    return c.json(
+      { error: "payload_too_large", totalBytes, maxBytes: EMAIL_MAX_TOTAL_ATTACHMENT_BYTES },
+      413,
+    );
+  }
+
   const id = crypto.randomUUID();
   const mode = payload.useTemplate ? "template" : "inline";
-  await insertEmailRequest(c.env, {
-    id,
-    app,
-    userId,
-    recipient: email,
-    mode,
-    subject: payload.subject ?? null,
-    templateId: payload.templateId ?? null,
-    payload: JSON.stringify(payload),
-  });
-  await c.env.PUSH_QUEUE.send({ kind: "email-send", requestId: id });
+
+  // Stage the bytes first: the stored reference is what makes a retry replayable.
+  const storedAttachments: StoredAttachment[] = [];
+  for (const upload of uploads) {
+    try {
+      const stored = await putAttachment(c.env, {
+        app,
+        id: crypto.randomUUID(),
+        filename: upload.filename,
+        contentType: upload.contentType,
+        file: upload.file,
+      });
+      if (upload.contentId !== undefined) stored.content_id = upload.contentId;
+      storedAttachments.push(stored);
+    } catch (error) {
+      // Never leave a half-staged request behind.
+      await deleteAttachments(
+        c.env,
+        storedAttachments.map((attachment) => attachment.key),
+        { requestId: id, reason: "upload_failed" },
+      );
+      console.error(
+        JSON.stringify({ msg: "attachment_upload_failed", requestId: id, error: String(error) }),
+      );
+      return c.json({ error: "attachment_upload_failed" }, 502);
+    }
+  }
+
+  // The stored payload replaces the caller's part descriptors with the resolved
+  // R2 references — the queue job and every retry read it back from D1.
+  const storedPayload: Record<string, unknown> = { ...payload };
+  if (storedAttachments.length > 0) storedPayload.attachments = storedAttachments;
+  else delete storedPayload.attachments;
+
+  try {
+    await insertEmailRequest(c.env, {
+      id,
+      app,
+      userId,
+      recipient: email,
+      mode,
+      subject: payload.subject ?? null,
+      templateId: payload.templateId ?? null,
+      payload: JSON.stringify(storedPayload),
+    });
+    await c.env.PUSH_QUEUE.send({ kind: "email-send", requestId: id });
+  } catch (error) {
+    await deleteAttachments(
+      c.env,
+      storedAttachments.map((attachment) => attachment.key),
+      { requestId: id, reason: "enqueue_failed" },
+    );
+    console.error(
+      JSON.stringify({ msg: "email_queue_failed", requestId: id, error: String(error) }),
+    );
+    throw error;
+  }
 
   console.log(
-    JSON.stringify({ msg: "email_queued", requestId: id, app, userId, mode, templateId: payload.templateId ?? null }),
+    JSON.stringify({
+      msg: "email_queued",
+      requestId: id,
+      app,
+      userId,
+      mode,
+      templateId: payload.templateId ?? null,
+      attachments: storedAttachments.length,
+    }),
   );
   return c.json(
     {
@@ -280,6 +513,8 @@ v1.post("/notifications/email", async (c) => {
       subject: payload.subject ?? null,
       templateId: payload.templateId ?? null,
       status: "queued",
+      // Metadata only — the bytes stay in R2.
+      attachments: storedAttachments.length > 0 ? summarizeAttachments(storedAttachments) : null,
       createdAt: new Date().toISOString(),
     },
     202,

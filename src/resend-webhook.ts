@@ -3,10 +3,12 @@ import { timingSafeEqual } from "./crypto";
 import {
   applyEmailWebhookEvent,
   bindEmailRequestResendId,
+  getEmailRequestById,
   recordResendWebhookEvent,
   requeueEmailRequestForRetry,
   type EmailStatus,
 } from "./db";
+import { attachmentKeysFromPayload, deleteAttachments } from "./attachments";
 import { EMAIL_MAX_ATTEMPTS, EMAIL_REQUEST_TAG } from "./email";
 import type { Bindings } from "./env";
 
@@ -161,6 +163,39 @@ export interface ResendWebhookResult {
 }
 
 /**
+ * Releases the staged attachments of a request.
+ *
+ * Only called once the email can no longer be retried, so the bytes are never
+ * needed again. Best-effort by design — a cleanup failure must not fail the
+ * webhook — and a request without attachments costs no R2 call at all.
+ */
+async function cleanupAttachments(
+  env: Bindings,
+  requestId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const request = await getEmailRequestById(env, requestId);
+    if (!request) return;
+
+    const keys = attachmentKeysFromPayload(request.payload);
+    if (keys.length === 0) return;
+
+    const deleted = await deleteAttachments(env, keys, { requestId });
+    console.log(JSON.stringify({ msg: "attachments_deleted", requestId, reason, deleted }));
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        msg: "attachments_cleanup_failed",
+        requestId,
+        reason,
+        error: String(error),
+      }),
+    );
+  }
+}
+
+/**
  * Records and applies one verified Resend webhook delivery.
  *
  * Every delivery is stored first (deduped on `svix-id`), then mapped onto the
@@ -251,6 +286,7 @@ export async function handleResendWebhookEvent(
     });
 
     if (retry === "requeued") {
+      // The next attempt still needs the staged bytes, so keep them.
       await env.PUSH_QUEUE.send({ kind: "email-send", requestId });
       console.log(
         JSON.stringify({ msg: "webhook_retry_queued", eventType, requestId, status }),
@@ -261,7 +297,21 @@ export async function handleResendWebhookEvent(
     console.warn(
       JSON.stringify({ msg: "webhook_retry_exhausted", eventType, requestId, status }),
     );
+    // The attempt budget is spent, so this is terminal: release the bytes.
+    await cleanupAttachments(env, requestId, "retries_exhausted");
     return { outcome: "applied", requestId };
+  }
+
+  // `delivered` and `bounced` are terminal, so the staged bytes are no longer
+  // needed. Only a freshly applied state frees them — an out-of-order event
+  // leaves the stored status alone, and a duplicate delivery deletes nothing
+  // because the objects are already gone (R2 deletes are idempotent).
+  if (
+    result.outcome === "ok" &&
+    result.requestId !== null &&
+    (status === "delivered" || status === "bounced")
+  ) {
+    await cleanupAttachments(env, result.requestId, status);
   }
 
   console.log(

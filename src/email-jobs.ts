@@ -1,4 +1,5 @@
 import type { Bindings } from "./env";
+import { attachmentKeysFromPayload, deleteAttachments } from "./attachments";
 import {
   getEmailRequestById,
   incrementEmailRequestAttempts,
@@ -13,9 +14,38 @@ import {
   toResendError,
   type EmailTransport,
 } from "./email";
-import { emailContentSchema, type EmailSendJob } from "./validation";
+import { storedEmailContentSchema, type EmailSendJob } from "./validation";
 
 export type EmailSendOutcome = "sent" | "failed" | "skipped";
+
+/**
+ * Records a permanent failure and releases the staged attachments.
+ *
+ * The bytes are only needed while another attempt is still possible, so every
+ * terminal path deletes them — that is what keeps the bucket from growing.
+ * The key list is read loosely so cleanup still works for a payload that failed
+ * to validate.
+ */
+async function failPermanently(
+  env: Bindings,
+  request: { id: string; payload: string },
+  input: { errorName: string; errorMessage: string; attempts: number },
+): Promise<void> {
+  await markEmailRequestFailed(env, { id: request.id, ...input });
+
+  const keys = attachmentKeysFromPayload(request.payload);
+  if (keys.length === 0) return;
+
+  const deleted = await deleteAttachments(env, keys, { requestId: request.id });
+  console.log(
+    JSON.stringify({
+      msg: "attachments_deleted",
+      requestId: request.id,
+      reason: input.errorName,
+      deleted,
+    }),
+  );
+}
 
 export interface EmailSendOptions {
   /** Injected in tests; defaults to the real Resend client. */
@@ -57,13 +87,12 @@ export async function processEmailSend(
     return "skipped";
   }
 
-  let content: ReturnType<typeof emailContentSchema.parse>;
+  let content: ReturnType<typeof storedEmailContentSchema.parse>;
   try {
-    content = emailContentSchema.parse(JSON.parse(request.payload));
+    content = storedEmailContentSchema.parse(JSON.parse(request.payload));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await markEmailRequestFailed(env, {
-      id: request.id,
+    await failPermanently(env, request, {
       errorName: "invalid_stored_payload",
       errorMessage: message.slice(0, 500),
       attempts: request.attempts + 1,
@@ -82,6 +111,7 @@ export async function processEmailSend(
       env,
       request,
       content,
+      content.attachments ?? [],
       options.transport ?? createResendTransport(env),
     );
     await markEmailRequestSent(env, {
@@ -120,8 +150,7 @@ export async function processEmailSend(
     }
 
     const errorName = resendError.retryable ? "retries_exhausted" : resendError.errorName;
-    await markEmailRequestFailed(env, {
-      id: request.id,
+    await failPermanently(env, request, {
       errorName,
       errorMessage: resendError.message.slice(0, 500),
       attempts: attempt,

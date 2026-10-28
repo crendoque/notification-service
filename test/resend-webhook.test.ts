@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:test";
 import { app } from "../src/index";
+import { attachmentKey } from "../src/attachments";
 import {
   applyEmailSchema,
   applyPushSchema,
@@ -42,6 +43,44 @@ function event(type: string, emailId: string, extra: Record<string, unknown> = {
   };
 }
 
+/** Removes every staged object so R2 assertions start from a clean bucket. */
+async function clearAttachments(): Promise<void> {
+  const { objects } = await env.ATTACHMENTS.list({ prefix: "attachments/" });
+  for (const object of objects) await env.ATTACHMENTS.delete(object.key);
+}
+
+/**
+ * Seeds a request whose stored payload references one staged object, and
+ * returns that object's key so the test can assert on its lifecycle.
+ */
+async function seedStaged(
+  id: string,
+  resendId: string,
+  status: string,
+  attempts = 0,
+): Promise<string> {
+  const key = attachmentKey("test-app", `${id}-att`);
+  await env.ATTACHMENTS.put(key, "invoice bytes");
+  await seedEmailRequests(env.DB, [
+    {
+      id,
+      recipient: "a@example.com",
+      status,
+      resendId,
+      attempts,
+      payload: JSON.stringify({
+        useTemplate: false,
+        subject: "Hi",
+        text: "hello",
+        attachments: [
+          { key, id: "att-1", filename: "invoice.pdf", content_type: "application/pdf", size: 13 },
+        ],
+      }),
+    },
+  ]);
+  return key;
+}
+
 async function readRequest(id: string) {
   return await env.DB.prepare(
     `SELECT status, resend_id, attempts, last_event, last_event_at, sent_at, delivered_at,
@@ -73,6 +112,7 @@ describe("POST /v1/webhooks/resend", () => {
   beforeEach(async () => {
     await env.DB.prepare("DELETE FROM email_requests").run();
     await env.DB.prepare("DELETE FROM resend_webhook_events").run();
+    await clearAttachments();
   });
 
   afterEach(() => {
@@ -384,5 +424,78 @@ describe("POST /v1/webhooks/resend", () => {
 
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: "server_misconfigured" });
+  });
+
+  describe("attachment cleanup", () => {
+    it("releases the staged bytes once the email is delivered", async () => {
+      const key = await seedStaged("req-delivered", "resend-delivered", "sent");
+      const signed = await signedWebhookRequest(
+        SECRET,
+        event("email.delivered", "resend-delivered"),
+      );
+
+      const res = await postWebhook(signed.body, signed.headers);
+
+      expect(res.status).toBe(200);
+      expect((await readRequest("req-delivered"))?.status).toBe("delivered");
+      expect(await env.ATTACHMENTS.get(key)).toBeNull();
+    });
+
+    it("releases the staged bytes when the email bounces", async () => {
+      const key = await seedStaged("req-bounce", "resend-bounce", "sent");
+      const signed = await signedWebhookRequest(SECRET, event("email.bounced", "resend-bounce"));
+
+      await postWebhook(signed.body, signed.headers);
+
+      expect(await env.ATTACHMENTS.get(key)).toBeNull();
+    });
+
+    it("releases the staged bytes once email.failed exhausts the retry budget", async () => {
+      const key = await seedStaged("req-exhausted", "resend-exhausted", "sent", 3);
+      const signed = await signedWebhookRequest(
+        SECRET,
+        event("email.failed", "resend-exhausted"),
+      );
+
+      await postWebhook(signed.body, signed.headers);
+
+      expect(await env.ATTACHMENTS.get(key)).toBeNull();
+    });
+
+    it("keeps the staged bytes while email.failed re-queues the request", async () => {
+      const key = await seedStaged("req-retry", "resend-retry", "sent");
+      vi.spyOn(env.PUSH_QUEUE, "send").mockResolvedValue(fakeQueueSendResponse());
+      const signed = await signedWebhookRequest(SECRET, event("email.failed", "resend-retry"));
+
+      const res = await postWebhook(signed.body, signed.headers);
+
+      expect(await res.json()).toMatchObject({ outcome: "requeued" });
+      // The next attempt still needs the file, so deleting here would break it.
+      expect(await env.ATTACHMENTS.get(key)).not.toBeNull();
+    });
+
+    it("keeps the staged bytes for events that are only observed", async () => {
+      const key = await seedStaged("req-opened", "resend-opened", "sent");
+      const signed = await signedWebhookRequest(SECRET, event("email.opened", "resend-opened"));
+
+      await postWebhook(signed.body, signed.headers);
+
+      expect(await env.ATTACHMENTS.get(key)).not.toBeNull();
+    });
+
+    it("does not pay the R2 cost for a request without attachments", async () => {
+      await seedEmailRequests(env.DB, [
+        { id: "req-plain", recipient: "a@example.com", status: "sent", resendId: "resend-plain" },
+      ]);
+      const signed = await signedWebhookRequest(SECRET, event("email.delivered", "resend-plain"));
+
+      const res = await postWebhook(signed.body, signed.headers);
+
+      expect(res.status).toBe(200);
+      expect((await readRequest("req-plain"))?.status).toBe("delivered");
+      expect(await env.ATTACHMENTS.list({ prefix: "attachments/" })).toMatchObject({
+        objects: [],
+      });
+    });
   });
 });

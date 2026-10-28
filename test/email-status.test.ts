@@ -70,6 +70,53 @@ describe("GET /v1/notifications/email/:id", () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: "not_found" });
   });
+
+  it("summarises attachments without leaking the bytes", async () => {
+    await seedEmailRequests(env.DB, [
+      {
+        id: "req-3",
+        recipient: "c@example.com",
+        payload: JSON.stringify({
+          useTemplate: false,
+          subject: "Invoice",
+          text: "attached",
+          attachments: [
+            {
+              key: "attachments/crm/att-1",
+              id: "att-1",
+              filename: "invoice.pdf",
+              content_type: "application/pdf",
+              size: 48211,
+            },
+            {
+              key: "attachments/crm/att-2",
+              id: "att-2",
+              filename: "statement.csv",
+              size: 120,
+            },
+          ],
+        }),
+      },
+    ]);
+
+    const res = await getJson("/v1/notifications/email/req-3");
+    const json = (await res.json()) as { attachments: unknown };
+
+    expect(json.attachments).toEqual([
+      { filename: "invoice.pdf", contentType: "application/pdf", size: 48211 },
+      { filename: "statement.csv", contentType: null, size: 120 },
+    ]);
+    // The R2 key is an internal detail, and the bytes are never returned.
+    expect(JSON.stringify(json)).not.toContain("attachments/crm/");
+  });
+
+  it("reports null attachments for a request without any", async () => {
+    await seedEmailRequests(env.DB, [{ id: "req-4", recipient: "d@example.com" }]);
+
+    const res = await getJson("/v1/notifications/email/req-4");
+
+    expect((await res.json()) as { attachments: unknown }).toMatchObject({ attachments: null });
+  });
 });
 
 describe("GET /v1/notifications/email", () => {

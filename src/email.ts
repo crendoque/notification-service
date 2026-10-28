@@ -1,6 +1,7 @@
 import type { Bindings } from "./env";
 import type { EmailRequestRow } from "./db";
-import type { EmailContentInput } from "./validation";
+import { getAttachmentBytes, toBase64 } from "./attachments";
+import type { EmailContentBase, StoredAttachment } from "./validation";
 
 /** Resend's single-email endpoint (the only one this worker needs). */
 export const RESEND_EMAILS_URL = "https://api.resend.com/emails";
@@ -14,6 +15,16 @@ export const EMAIL_REQUEST_TAG = "request_id";
  */
 export const EMAIL_MAX_ATTEMPTS = 3;
 
+/** One Resend attachment. The worker always sends `content` (base64), never a URL. */
+export interface ResendAttachment {
+  filename: string;
+  /** Base64-encoded bytes of the file. */
+  content?: string;
+  content_type?: string;
+  /** Set to embed the file inline, e.g. `<img src="cid:logo">`. */
+  content_id?: string;
+}
+
 /** The Resend request body we build (To-only; the worker never sets cc/bcc). */
 export interface ResendEmailPayload {
   from: string;
@@ -23,6 +34,7 @@ export interface ResendEmailPayload {
   text?: string;
   reply_to?: string | string[];
   scheduled_at?: string;
+  attachments?: ResendAttachment[];
   tags: { name: string; value: string }[];
   template?: { id: string; variables?: Record<string, string | number> };
 }
@@ -64,6 +76,28 @@ export function toResendError(error: unknown): ResendError {
     message: error instanceof Error ? error.message : String(error),
     retryable: true,
   });
+}
+
+/**
+ * A staged attachment is no longer in R2 (already cleaned up, or lost).
+ *
+ * Extending ResendError plugs this straight into the existing permanent-failure
+ * path: the email must never go out with a silently dropped file, and no retry
+ * can bring the object back.
+ */
+export class AttachmentMissingError extends ResendError {
+  readonly key: string;
+
+  constructor(key: string) {
+    super({
+      statusCode: 0,
+      errorName: "attachment_missing",
+      message: `Attachment is no longer available in R2: ${key}`,
+      retryable: false,
+    });
+    this.name = "AttachmentMissingError";
+    this.key = key;
+  }
 }
 
 function parseJsonObject(raw: string): Record<string, unknown> | null {
@@ -167,11 +201,17 @@ export function resolveSender(
   return { ok: false };
 }
 
-/** Builds the Resend request body from the stored request + its payload. */
+/**
+ * Builds the Resend request body from the stored request + its payload.
+ *
+ * `attachments` are already-resolved base64 parts, so this stays pure and
+ * synchronous; `resolveAttachments` does the R2 reads.
+ */
 export function buildResendPayload(
   request: Pick<EmailRequestRow, "id" | "app" | "recipient">,
-  content: EmailContentInput,
+  content: EmailContentBase,
   from: string,
+  attachments: ResendAttachment[] = [],
 ): ResendEmailPayload {
   const payload: ResendEmailPayload = {
     from,
@@ -195,20 +235,51 @@ export function buildResendPayload(
     if (content.text !== undefined) payload.text = content.text;
   }
 
+  if (attachments.length > 0) payload.attachments = attachments;
+
   return payload;
 }
 
-/** Sends one stored email request through Resend. */
+/**
+ * Loads the staged bytes from R2 and encodes them for Resend.
+ *
+ * Resend accepts either base64 `content` or a remote `path`; we always send the
+ * content, so the recipient gets a real attachment and no URL exists anywhere.
+ * A missing object throws rather than sending a silently incomplete email.
+ */
+export async function resolveAttachments(
+  env: Bindings,
+  attachments: StoredAttachment[],
+): Promise<ResendAttachment[]> {
+  const resolved: ResendAttachment[] = [];
+  for (const attachment of attachments) {
+    const bytes = await getAttachmentBytes(env, attachment.key);
+    if (bytes === null) throw new AttachmentMissingError(attachment.key);
+
+    const entry: ResendAttachment = {
+      filename: attachment.filename,
+      content: toBase64(bytes),
+    };
+    if (attachment.content_type !== undefined) entry.content_type = attachment.content_type;
+    if (attachment.content_id !== undefined) entry.content_id = attachment.content_id;
+    resolved.push(entry);
+  }
+  return resolved;
+}
+
+/** Sends one stored email request through Resend, with its staged attachments. */
 export async function sendEmailRequest(
   env: Bindings,
   request: Pick<EmailRequestRow, "id" | "app" | "recipient">,
-  content: EmailContentInput,
+  content: EmailContentBase,
+  storedAttachments: StoredAttachment[] = [],
   transport: EmailTransport = createResendTransport(env),
 ): Promise<{ id: string }> {
   const sender = resolveSender(env, content.from);
   // resolveSender already ran during validation; falling back keeps a stored
   // request replayable even if the allowlist changed afterwards.
   const from = sender.ok ? sender.from : env.EMAIL_FROM;
-  const payload = buildResendPayload(request, content, from);
+  const attachments = await resolveAttachments(env, storedAttachments);
+  const payload = buildResendPayload(request, content, from, attachments);
   return await transport.send(payload, { idempotencyKey: content.idempotencyKey });
 }
